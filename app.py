@@ -271,19 +271,19 @@ elif page == "Check a Transaction":
                     values = {}
                     cols = st.columns(2)
                     for i, feature in enumerate(features):
-                      with cols[i % 2]:
-                        if pd.api.types.is_numeric_dtype(X[feature]):
-                           series = pd.to_numeric(df[feature], errors="coerce").dropna()
-                           default = float(series.median()) if not series.empty else 0.0
-                           values[feature] = st.number_input(feature, value=default, format="%.4f", key=f"feature_{feature}")
-                        else:
-                            options = X[feature].dropna().astype(str).value_counts().index.tolist()
-                            options = options or ["Unknown"]
-                            values[feature] = st.selectbox(feature, options, key=f"feature_{feature}")
-                 model_name = st.selectbox("Classifier", list(build_models().keys()), key="prediction_model")
-                 submitted = st.form_submit_button("Analyse transaction", type="primary")
+                        with cols[i % 2]:
+                           if pd.api.types.is_numeric_dtype(X[feature]):
+                                series = pd.to_numeric(df[feature], errors="coerce").dropna()
+                                default = float(series.median()) if not series.empty else 0.0
+                                values[feature] = st.number_input(feature, value=default, format="%.4f", key=f"feature_{feature}")
+                           else:
+                               options = X[feature].dropna().astype(str).value_counts().index.tolist()
+                               options = options or ["Unknown"]
+                               values[feature] = st.selectbox(feature, options, key=f"feature_{feature}")
+                   model_name = st.selectbox("Classifier", list(build_models().keys()), key="prediction_model")
+                   submitted = st.form_submit_button("Analyse transaction", type="primary")
             if submitted:
-                 try:
+                try:
                     saved = Path("fraud_model.joblib")
                     saved_bundle = None
                     if saved.exists():
