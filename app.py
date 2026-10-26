@@ -1,3 +1,195 @@
+"""
+Online Fraud Detection — Streamlit web application
+Concepts adapted from the user's two uploaded experiment documents:
+- Experiment 1.3: supervised learning workflow, train/test split, StandardScaler,
+  Gaussian Naive Bayes, stratified 10-fold CV, confusion matrix, ROC curve,
+  Accuracy, Precision, Recall, F1, ROC-AUC, Cohen's Kappa, MCC.
+- Experiment 1.4: comparing classification algorithms using stratified CV.
+"""
+from pathlib import Path
+import time
+import numpy as np
+import pandas as pd
+import streamlit as st
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.base import clone
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_validate
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+import joblib
+from sklearn.naive_bayes import GaussianNB
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier, GradientBoostingClassifier, AdaBoostClassifier
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, roc_auc_score,
+    confusion_matrix, roc_curve, cohen_kappa_score, matthews_corrcoef
+)
+
+st.set_page_config(page_title="FraudShield | Online Fraud Detection", page_icon="🛡️", layout="wide")
+
+st.markdown("""
+<style>
+.stApp {background: linear-gradient(180deg, #0b1220 0%, #101b2d 100%); color:#eef4ff;}
+[data-testid="stSidebar"] {background:#111c2d;}
+.hero {padding: 1.4rem 1.6rem; border:1px solid #2b405e; border-radius:18px;
+background:linear-gradient(120deg,#14263e,#162f3a); margin-bottom:1rem;}
+.hero h1 {font-size:2.35rem; margin:0; color:#f3f7ff;}
+.hero p {color:#b8c9de; font-size:1rem; margin:.45rem 0 0;}
+.kpi {background:#14243a; border:1px solid #2c4260; padding:1rem; border-radius:14px;}
+.kpi-label {color:#9eb3cc; font-size:.85rem;}
+.kpi-value {font-size:1.55rem; font-weight:700; color:#f6fbff;}
+.small-note {color:#aabbd0; font-size:.85rem;}
+</style>
+""", unsafe_allow_html=True)
+
+st.sidebar.title("🛡️ FraudShield")
+st.sidebar.caption("Machine-learning fraud analysis")
+page = st.sidebar.radio("Navigate", ["Overview", "Check a Transaction", "Model Lab", "Dataset Analysis", "About & Concepts"])
+st.sidebar.divider()
+st.sidebar.caption("Educational prototype • No real payment processing")
+
+@st.cache_data
+def load_csv(file_bytes):
+    from io import BytesIO
+    return pd.read_csv(BytesIO(file_bytes))
+
+def build_models(X=None):
+    """Return model estimators, or full preprocessing pipelines when X is supplied."""
+    raw = {
+        "Gaussian Naive Bayes": GaussianNB(),
+        "Logistic Regression": LogisticRegression(max_iter=1500, class_weight="balanced"),
+        "Decision Tree": DecisionTreeClassifier(max_depth=8, class_weight="balanced", random_state=42),
+        "K-Nearest Neighbors": KNeighborsClassifier(n_neighbors=5),
+        "Support Vector Machine": SVC(probability=True, class_weight="balanced", random_state=42),
+        "Random Forest": RandomForestClassifier(n_estimators=120, max_depth=12, class_weight="balanced", random_state=42, n_jobs=-1),
+        "Extra Trees": ExtraTreesClassifier(n_estimators=120, max_depth=12, class_weight="balanced", random_state=42, n_jobs=-1),
+        "Gradient Boosting": GradientBoostingClassifier(random_state=42),
+        "AdaBoost": AdaBoostClassifier(random_state=42),
+    }
+    if X is None:
+        return raw
+
+    # IDs usually identify a row/person rather than describe transaction risk.
+    X = X.drop(columns=[c for c in ["Transaction_ID", "User_ID"] if c in X.columns], errors="ignore")
+    numeric_features = X.select_dtypes(include=[np.number]).columns.tolist()
+    categorical_features = X.select_dtypes(exclude=[np.number]).columns.tolist()
+
+    transformers = []
+    if numeric_features:
+        numeric_pipeline = Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+        ])
+        transformers.append(("numeric", numeric_pipeline, numeric_features))
+    if categorical_features:
+        categorical_pipeline = Pipeline([
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+        ])
+        transformers.append(("categorical", categorical_pipeline, categorical_features))
+            
+    preprocessor = ColumnTransformer(transformers=transformers, remainder="drop")
+    return {
+        name: Pipeline([
+            ("preprocessor", clone(preprocessor)),
+            ("classifier", estimator),
+        ]) for name, estimator in raw.items()
+    }
+
+def target_col(df):
+    candidates = ["is_fraud", "fraud", "Class", "class", "target", "label", "isFraud", "is_fraudulent", "Fraudulent"]
+    lookup = {str(c).lower(): c for c in df.columns}
+    for c in candidates:
+        if c.lower() in lookup:
+            return lookup[c.lower()]
+    return None
+
+def score_model(model, X_test, y_test):
+    pred = model.predict(X_test)
+    prob = model.predict_proba(X_test)[:, 1] if hasattr(model, "predict_proba") else None
+    out = {
+        "Accuracy": accuracy_score(y_test, pred),
+        "Precision": precision_score(y_test, pred, zero_division=0),
+        "Recall": recall_score(y_test, pred, zero_division=0),
+        "F1 Score": f1_score(y_test, pred, zero_division=0),
+        "Cohen's Kappa": cohen_kappa_score(y_test, pred),
+        "MCC": matthews_corrcoef(y_test, pred),
+    }
+    out["ROC-AUC"] = roc_auc_score(y_test, prob) if prob is not None and len(np.unique(y_test)) == 2 else np.nan
+    return pred, prob, out
+
+def prepare_xy(df, target):
+    """Prepare labelled data while keeping numeric and categorical features."""
+    if target not in df.columns:
+        raise ValueError(f"Target column '{target}' was not found in the dataset.")
+    y = pd.to_numeric(df[target], errors="coerce")
+    valid = y.notna()
+    X = df.loc[valid].drop(columns=[target]).copy()
+    y = y.loc[valid].astype(int)
+
+    # Remove identifier columns so the model learns transaction patterns, not IDs.
+    X = X.drop(columns=[c for c in ["Transaction_ID", "User_ID"] if c in X.columns], errors="ignore")
+    if X.shape[1] == 0:
+        raise ValueError("No feature columns are available after removing IDs.")
+    if y.nunique() != 2:
+        raise ValueError("Choose a binary target column, such as Fraudulent (0 = legitimate, 1 = fraud).")
+    if y.value_counts().min() < 2:
+        raise ValueError("Each target class needs at least two examples.")
+    return X, y
+
+
+def train_experiment(df, target, model_name, test_size=0.2):
+    X, y = prepare_xy(df, target)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=test_size, random_state=42, stratify=y
+    )
+    model = build_models(X)[model_name]
+    model.fit(X_train, y_train)
+    pred, prob, metrics = score_model(model, X_test, y_test)
+    return X, y, X_train, X_test, y_train, y_test, model, pred, prob, metrics
+
+
+def save_trained_model(model, X, target, model_name):
+    """Save the complete pipeline and the exact feature order used at training."""
+    joblib.dump({
+        "model": model,
+        "features": list(X.columns),
+        "target": target,
+        "model_name": model_name,
+    }, "fraud_model.joblib")
+
+
+def get_data():
+    if "fraud_df" in st.session_state:
+        return st.session_state["fraud_df"], st.session_state.get("fraud_source", "Uploaded dataset")
+    return None, None
+
+st.markdown("""
+<div class="hero">
+  <h1>🛡️ FraudShield</h1>
+  <p>Online Fraud Detection • Supervised learning, transaction risk signals, and model evaluation.</p>
+</div>
+""", unsafe_allow_html=True)
+
+if page == "Overview":
+    st.subheader("Fraud monitoring dashboard")
+    st.write("Explore a transaction dataset, train a binary classifier, and compare models using standard machine-learning metrics.")
+    df, source = get_data()
+    if df is None:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Dataset", "Not loaded")
+        c2.metric("Model", "Not trained")
+        c3.metric("Risk checks", "Demo only")
+        st.info("Start by opening **Dataset Analysis** and uploading a labelled CSV. A `0/1` fraud label is recommended.")
+    else:
+        tcol = target_col(df)
         a, b, c, d = st.columns(4)
         a.metric("Transactions / rows", f"{len(df):,}")
         b.metric("Available features", str(max(0, len(df.columns)-1)))
