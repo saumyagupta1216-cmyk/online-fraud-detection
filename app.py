@@ -18,7 +18,9 @@ from sklearn.base import clone
 from sklearn.model_selection import train_test_split, StratifiedKFold, cross_validate
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+import joblib
 from sklearn.naive_bayes import GaussianNB
 from sklearn.linear_model import LogisticRegression
 from sklearn.tree import DecisionTreeClassifier
@@ -59,7 +61,7 @@ def load_csv(file_bytes):
     return pd.read_csv(BytesIO(file_bytes))
 
 def build_models():
-    # Scaling/imputation are inside each pipeline to avoid leakage during CV.
+    """Return model estimators, or full preprocessing pipelines when X is supplied."""
     raw = {
         "Gaussian Naive Bayes": GaussianNB(),
         "Logistic Regression": LogisticRegression(max_iter=1500, class_weight="balanced"),
@@ -71,16 +73,38 @@ def build_models():
         "Gradient Boosting": GradientBoostingClassifier(random_state=42),
         "AdaBoost": AdaBoostClassifier(random_state=42),
     }
-    return {
-        name: Pipeline([
+     if X is None:
+        return raw
+
+    # IDs usually identify a row/person rather than describe transaction risk.
+    X = X.drop(columns=[c for c in ["Transaction_ID", "User_ID"] if c in X.columns], errors="ignore")
+    numeric_features = X.select_dtypes(include=[np.number]).columns.tolist()
+    categorical_features = X.select_dtypes(exclude=[np.number]).columns.tolist()
+
+    transformers = []
+    if numeric_features:
+        numeric_pipeline = Pipeline([
             ("imputer", SimpleImputer(strategy="median")),
             ("scaler", StandardScaler()),
+        ])
+        transformers.append(("numeric", numeric_pipeline, numeric_features))
+    if categorical_features:
+        categorical_pipeline = Pipeline([
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+        ])
+        transformers.append(("categorical", categorical_pipeline, categorical_features))
+
+    preprocessor = ColumnTransformer(transformers=transformers, remainder="drop")
+    return {
+        name: Pipeline([
+            ("preprocessor", clone(preprocessor)),
             ("classifier", estimator),
         ]) for name, estimator in raw.items()
     }
 
 def target_col(df):
-    candidates = ["is_fraud", "fraud", "Class", "class", "target", "label", "isFraud", "is_fraudulent"]
+    candidates = ["is_fraud", "fraud", "Class", "class", "target", "label", "isFraud", "is_fraudulent", "Fraudulent"]
     lookup = {str(c).lower(): c for c in df.columns}
     for c in candidates:
         if c.lower() in lookup:
@@ -101,28 +125,44 @@ def score_model(model, X_test, y_test):
     out["ROC-AUC"] = roc_auc_score(y_test, prob) if prob is not None and len(np.unique(y_test)) == 2 else np.nan
     return pred, prob, out
 
-def train_experiment(df, target, model_name, test_size=0.2):
-    X = df.drop(columns=[target])
-    y = df[target]
-    if y.nunique() != 2:
-        raise ValueError("Please choose a binary target column (two classes, e.g. 0 = legitimate and 1 = fraud).")
-    # Drop obvious ID/text columns; keep numeric model features.
-    X = X.select_dtypes(include=[np.number]).copy()
-    if X.shape[1] == 0:
-        raise ValueError("No numeric feature columns found. Encode categorical columns before training.")
-    # Remove rows where target is missing, then align X.
+def prepare_xy(df, target):
+    """Prepare labelled data while keeping numeric and categorical features."""
+    if target not in df.columns:
+        raise ValueError(f"Target column '{target}' was not found in the dataset.")
+    y = pd.to_numeric(df[target], errors="coerce")
     valid = y.notna()
-    X, y = X.loc[valid], y.loc[valid]
-    y = y.astype(int)
+    X = df.loc[valid].drop(columns=[target]).copy()
+    y = y.loc[valid].astype(int)
+
+    # Remove identifier columns so the model learns transaction patterns, not IDs.
+    X = X.drop(columns=[c for c in ["Transaction_ID", "User_ID"] if c in X.columns], errors="ignore")
+    if X.shape[1] == 0:
+        raise ValueError("No feature columns are available after removing IDs.")
+    if y.nunique() != 2:
+        raise ValueError("Choose a binary target column, such as Fraudulent (0 = legitimate, 1 = fraud).")
     if y.value_counts().min() < 2:
-        raise ValueError("Each target class needs at least two examples for a stratified split.")
+        raise ValueError("Each target class needs at least two examples.")
+    return X, y
+
+
+def train_experiment(df, target, model_name, test_size=0.2):
+    X, y = prepare_xy(df, target)
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=42, stratify=y
     )
-    model = build_models()[model_name]
+    model = build_models(X)[model_name]
     model.fit(X_train, y_train)
     pred, prob, metrics = score_model(model, X_test, y_test)
     return X, y, X_train, X_test, y_train, y_test, model, pred, prob, metrics
+
+def save_trained_model(model, X, target, model_name):
+    """Save the complete pipeline and the exact feature order used at training."""
+    joblib.dump({
+        "model": model,
+        "features": list(X.columns),
+        "target": target,
+        "model_name": model_name,
+    }, "fraud_model.joblib")
 
 def get_data():
     if "fraud_df" in st.session_state:
@@ -225,34 +265,56 @@ elif page == "Check a Transaction":
             if not features:
                 st.error("No numeric features are available.")
             else:
+                X, y = prepare_xy(df, target)
                 with st.form("transaction_form"):
                     st.write("Enter values for the numeric features in your dataset:")
                     values = {}
                     cols = st.columns(2)
                     for i, feature in enumerate(features):
-                        series = pd.to_numeric(df[feature], errors="coerce").dropna()
-                        default = float(series.median()) if not series.empty else 0.0
-                        with cols[i % 2]:
-                            values[feature] = st.number_input(feature, value=default, format="%.4f", key=f"feature_{feature}")
-                    model_name = st.selectbox("Classifier", list(build_models().keys()), key="prediction_model")
-                    submitted = st.form_submit_button("Analyse transaction", type="primary")
-                if submitted:
-                    try:
-                        X, y, X_train, X_test, y_train, y_test, model, pred, prob, metrics = train_experiment(df, target, model_name)
-                        row = pd.DataFrame([values], columns=X.columns)
-                        label = int(model.predict(row)[0])
-                        probability = float(model.predict_proba(row)[0, 1]) if hasattr(model, "predict_proba") else None
-                        if label == 1:
-                            st.error("Model classification: FRAUD-LIKE")
+                      with cols[i % 2]:
+                        if pd.api.types.is_numeric_dtype(X[feature]):
+                           series = pd.to_numeric(df[feature], errors="coerce").dropna()
+                           default = float(series.median()) if not series.empty else 0.0
+                           values[feature] = st.number_input(feature, value=default, format="%.4f", key=f"feature_{feature}")
                         else:
-                            st.success("Model classification: LEGITIMATE-LIKE")
-                        if probability is not None:
-                            st.metric("Estimated positive-class probability", f"{probability*100:.2f}%")
-                        st.caption("This is a model output, not a definitive fraud finding. Confirm the dataset's positive class means fraud.")
-                        st.markdown("**Held-out test performance for this classifier**")
+                            options = X[feature].dropna().astype(str).value_counts().index.tolist()
+                            options = options or ["Unknown"]
+                            values[feature] = st.selectbox(feature, options, key=f"feature_{feature}")
+                 model_name = st.selectbox("Classifier", list(build_models().keys()), key="prediction_model")
+                 submitted = st.form_submit_button("Analyse transaction", type="primary")
+            if submitted:
+                 try:
+                    saved = Path("fraud_model.joblib")
+                    saved_bundle = None
+                    if saved.exists():
+                        try:
+                            saved_bundle = joblib.load(saved)
+                        except Exception:
+                            saved_bundle = None
+                    if saved_bundle and saved_bundle.get("target") == target and saved_bundle.get("model_name") == model_name and saved_bundle.get("features") == list(X.columns):
+                        model = saved_bundle["model"]
+                        st.info("Loaded the previously trained model. It was trained on the full uploaded dataset, so separate test metrics are not shown here.")
+                        metrics = None
+                    else:
+                        X_all, y_all, X_train, X_test, y_train, y_test, model, pred, prob, metrics = train_experiment(df, target, model_name)
+                        save_trained_model(model, X_all, target, model_name)
+                        st.success("Model trained and saved as fraud_model.joblib.")
+                    row = pd.DataFrame([values], columns=X.columns)
+                    label = int(model.predict(row)[0])
+                    probability = float(model.predict_proba(row)[0, 1]) if hasattr(model, "predict_proba") else None
+                    if label == 1:
+                        st.error("Model classification: FRAUD-LIKE")
+                    else:
+                        st.success("Model classification: LEGITIMATE-LIKE")
+                    if probability is not None:
+                        st.metric("Estimated fraud probability", f"{probability * 100:.2f}%")
+                    st.caption("Confirm that the dataset's positive class means fraud. Predictions are not guaranteed to be correct.")
+                    if metrics is not None:
+                        st.markdown("**Held-out test performance**")
                         st.json({k: round(float(v), 4) for k, v in metrics.items() if pd.notna(v)})
-                    except Exception as e:
-                        st.error(f"Could not train or score model: {e}")
+                except Exception as e:
+                    st.error(f"Could not train or score model: {e}")
+   
 
 elif page == "Model Lab":
     st.subheader("Classification model laboratory")
@@ -264,43 +326,52 @@ elif page == "Model Lab":
         target = st.session_state.get("fraud_target", target_col(df))
         if not target or target not in df.columns:
             target = st.selectbox("Target column", list(df.columns))
-        models = build_models()
-        chosen_models = st.multiselect("Models to compare", list(models.keys()), default=["Gaussian Naive Bayes", "Logistic Regression", "Decision Tree", "Random Forest"])
-        folds = st.select_slider("Cross-validation folds", options=[3, 5, 10], value=5)
-        run = st.button("Run model comparison", type="primary", disabled=not chosen_models)
-        if run:
-            X = df.drop(columns=[target]).select_dtypes(include=[np.number]).copy()
-            y = pd.to_numeric(df.loc[X.index, target], errors="coerce")
-            valid = y.notna()
-            X, y = X.loc[valid], y.loc[valid].astype(int)
-            if y.nunique() != 2 or y.value_counts().min() < folds:
-                st.error(f"Need exactly two target classes and at least {folds} examples in each class.")
-            elif X.empty or X.shape[1] == 0:
-                st.error("No numeric feature columns available.")
-            else:
-                cv = StratifiedKFold(n_splits=folds, shuffle=True, random_state=42)
-                scoring = {"Accuracy":"accuracy", "Precision":"precision", "Recall":"recall", "F1 Score":"f1", "ROC-AUC":"roc_auc"}
-                rows = []
-                progress = st.progress(0, text="Evaluating models…")
-                for i, name in enumerate(chosen_models):
-                    start = time.time()
-                    try:
-                        scores = cross_validate(models[name], X, y, cv=cv, scoring=scoring, error_score="raise", n_jobs=None)
-                        rows.append({"Model":name, **{metric:float(np.mean(scores[f"test_{metric}"])) for metric in scoring}, "Time (sec)":time.time()-start})
-                    except Exception as e:
-                        st.warning(f"{name} could not be evaluated: {e}")
-                    progress.progress((i+1)/len(chosen_models), text=f"Evaluated {i+1} of {len(chosen_models)}")
-                if rows:
-                    result = pd.DataFrame(rows).sort_values("F1 Score", ascending=False).reset_index(drop=True)
-                    st.session_state["model_comparison"] = result
-                    st.dataframe(result.style.format({c:"{:.4f}" for c in result.select_dtypes("number").columns}), use_container_width=True)
-                    fig, ax = plt.subplots(figsize=(10, 4))
-                    sns.barplot(data=result, x="Model", y="F1 Score", ax=ax)
-                    ax.set_ylim(0, 1)
-                    ax.tick_params(axis="x", rotation=35)
-                    ax.set_title("Cross-validation F1 comparison")
-                    st.pyplot(fig)
-                    st.download_button("Download comparison CSV", result.to_csv(index=False), "model_comparison.csv", "text/csv")
+        try:
+          X, y = prepare_xy(df, target)
+          models = build_models()
+      ]   chosen_models = st.multiselect("Models to compare", list(models.keys()), default=["Gaussian Naive Bayes", "Logistic Regression", "Decision Tree", "Random Forest"])
+          folds = st.select_slider("Cross-validation folds", options=[3, 5, 10], value=5)
+          run = st.button("Run model comparison", type="primary", disabled=not chosen_models)
+          if run:
+                  if y.value_counts().min() < folds:
+                    st.error(f"Need at least {folds} examples in each class.")
+                  else:
+                    cv = StratifiedKFold(n_splits=folds, shuffle=True, random_state=42)
+                    scoring = {"Accuracy":"accuracy", "Precision":"precision", "Recall":"recall", "F1 Score":"f1", "ROC-AUC":"roc_auc"}
+                    rows = []
+                    progress = st.progress(0, text="Evaluating models…")
+                    for i, name in enumerate(chosen_models):
+                      start = time.time()
+                      try:
+                          scores = cross_validate(models[name], X, y, cv=cv, scoring=scoring, error_score="raise", n_jobs=None)
+                          rows.append({"Model":name, **{metric:float(np.mean(scores[f"test_{metric}"])) for metric in scoring}, "Time (sec)":time.time()-start})
+                      except Exception as e:
+                          st.warning(f"{name} could not be evaluated: {e}")
+                      progress.progress((i+1)/len(chosen_models), text=f"Evaluated {i+1} of {len(chosen_models)}")
+                 if rows:
+                     result = pd.DataFrame(rows).sort_values("F1 Score", ascending=False).reset_index(drop=True)
+                     st.session_state["model_comparison"] = result
+                     st.dataframe(result.style.format({c:"{:.4f}" for c in result.select_dtypes("number").columns}), use_container_width=True)
+                     fig, ax = plt.subplots(figsize=(10, 4))
+                     sns.barplot(data=result, x="Model", y="F1 Score", ax=ax)
+                     ax.set_ylim(0, 1)
+                     ax.tick_params(axis="x", rotation=35)
+                     ax.set_title("Cross-validation F1 comparison")
+                     st.pyplot(fig)
+                     st.download_button("Download comparison CSV", result.to_csv(index=False), "model_comparison.csv", "text/csv")
+          st.markdown("### Train and save a model")
+            chosen_to_save = st.selectbox("Model to train and save", model_names, index=model_names.index("Random Forest"))
+            if st.button("Train and save selected model", type="primary", key="save_model_button"):
+                with st.spinner("Training model and preparing the saved file…"):
+                    X_train, y_train = X, y
+                    saved_model = build_models(X)[chosen_to_save]
+                    saved_model.fit(X_train, y_train)
+                    save_trained_model(saved_model, X, target, chosen_to_save)
+                st.success("Training complete! Saved as fraud_model.joblib.")
+                with open("fraud_model.joblib", "rb") as model_file:
+                    st.download_button("Download trained model", model_file, file_name="fraud_model.joblib", mime="application/octet-stream")
+        except Exception as e:
+            st.error(f"Could not prepare dataset: {e}")
     st.markdown("#### Included algorithms")
     st.caption("Gaussian Naive Bayes, Logistic Regression, Decision Tree, KNN, SVM, Random Forest, Extra Trees, Gradient Boosting, and AdaBoost.")
 
