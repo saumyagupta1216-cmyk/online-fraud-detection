@@ -73,7 +73,7 @@ def build_models():
         "Gradient Boosting": GradientBoostingClassifier(random_state=42),
         "AdaBoost": AdaBoostClassifier(random_state=42),
     }
-     if X is None:
+    if X is None:
         return raw
 
     # IDs usually identify a row/person rather than describe transaction risk.
