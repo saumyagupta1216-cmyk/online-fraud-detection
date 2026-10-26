@@ -280,7 +280,7 @@ elif page == "Check a Transaction":
                                options = X[feature].dropna().astype(str).value_counts().index.tolist()
                                options = options or ["Unknown"]
                                values[feature] = st.selectbox(feature, options, key=f"feature_{feature}")
-                   model_name = st.selectbox("Classifier", list(build_models().keys()), key="prediction_model")
+                   model_name = st.selectbox("Classifier", list(build_models().keys()), index=list(build_models().keys()).index("Random Forest"), key="prediction_model")
                    submitted = st.form_submit_button("Analyse transaction", type="primary")
             if submitted:
                 try:
