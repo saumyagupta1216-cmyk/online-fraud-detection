@@ -350,3 +350,59 @@ elif page == "Model Lab":
                         result = pd.DataFrame(rows).sort_values("F1 Score", ascending=False).reset_index(drop=True)
                         st.session_state["model_comparison"] = result
                         st.dataframe(result.style.format({c: "{:.4f}" for c in result.select_dtypes("number").columns}), use_container_width=True)
+                        fig, ax = plt.subplots(figsize=(10, 4))
+                        sns.barplot(data=result, x="Model", y="F1 Score", ax=ax)
+                        ax.set_ylim(0, 1)
+                        ax.tick_params(axis="x", rotation=35)
+                        ax.set_title("Cross-validation F1 comparison")
+                        st.pyplot(fig)
+                        st.download_button("Download comparison CSV", result.to_csv(index=False), "model_comparison.csv", "text/csv")
+
+            st.markdown("### Train and save a model")
+            chosen_to_save = st.selectbox("Model to train and save", model_names, index=model_names.index("Random Forest"))
+            if st.button("Train and save selected model", type="primary", key="save_model_button"):
+                with st.spinner("Training model and preparing the saved file…"):
+                    X_train, y_train = X, y
+                    saved_model = build_models(X)[chosen_to_save]
+                    saved_model.fit(X_train, y_train)
+                    save_trained_model(saved_model, X, target, chosen_to_save)
+                st.success("Training complete! Saved as fraud_model.joblib.")
+                with open("fraud_model.joblib", "rb") as model_file:
+                    st.download_button("Download trained model", model_file, file_name="fraud_model.joblib", mime="application/octet-stream")
+        except Exception as e:
+            st.error(f"Could not prepare dataset: {e}")
+    st.markdown("#### Included algorithms")
+    st.caption("Gaussian Naive Bayes, Logistic Regression, Decision Tree, KNN, SVM, Random Forest, Extra Trees, Gradient Boosting, and AdaBoost.")
+
+elif page == "About & Concepts":
+    st.subheader("Concepts used from your experiment documents")
+    st.markdown("""
+    **Experiment 1.3 — supervised learning and classifier evaluation**
+    - **Features (X) and labels (y):** transaction attributes are model inputs; the fraud label is the target.
+    - **Train/test split:** default holdout is 80% training and 20% testing, stratified by class.
+    - **Preprocessing:** missing numeric values are median-imputed and scaled; missing categorical values are filled with the most common value and text categories are one-hot encoded inside a pipeline.
+    - **Gaussian Naive Bayes:** included as a classifier from the experiment.
+    - **Evaluation:** Accuracy, Precision, Recall, F1-score, ROC-AUC, confusion matrix, Cohen's Kappa, and Matthews Correlation Coefficient (MCC).
+    - **Cross-validation:** stratified folds help assess performance across class-balanced folds.
+
+    **Experiment 1.4 — comparing classification algorithms**
+    - Compare multiple classifiers under the same stratified cross-validation scheme.
+    - View mean Accuracy, Precision, Recall, F1-score, ROC-AUC, and execution time.
+    - Algorithms include Logistic Regression, Decision Tree, Random Forest, SVM, KNN, Naive Bayes, Extra Trees, Gradient Boosting, and AdaBoost.
+
+    **Important scope note:** the uploaded experiments use a heart-disease dataset (`heart.csv`) as their example, not a fraud dataset. This app adapts their classification workflow to fraud detection, but real fraud performance can only be measured with a suitable labelled transaction dataset.
+    """)
+    st.markdown("#### How to read the metrics")
+    st.markdown("""
+    - **Precision:** of transactions flagged as fraud, the share that are actually fraud.
+    - **Recall:** of fraudulent transactions, the share detected by the model.
+    - **F1-score:** balance between precision and recall.
+    - **ROC-AUC:** how well the model ranks positive examples above negative ones.
+    - **Confusion matrix:** counts of true/false positives and true/false negatives.
+    - **MCC / Kappa:** agreement measures that can be useful when classes are imbalanced.
+    """)
+    st.info("Educational prototype only. Do not use its output to approve, decline, or accuse in real financial transactions without proper validation, monitoring, privacy controls, and expert review.")
+
+st.sidebar.divider()
+st.sidebar.caption("FraudShield • Supervised ML demo")
+
